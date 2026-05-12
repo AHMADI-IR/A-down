@@ -1,0 +1,70 @@
+name: 📥 TG Power Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_links:
+        description: '🔗 لینک‌های تلگرام (برای چند لینک با فاصله جدا کنید)'
+        required: true
+        type: string
+        placeholder: 'https://t.me/channel/123 https://t.me/channel/456'
+      compress:
+        description: '📦 فشرده‌سازی خودکار به ZIP؟'
+        required: false
+        type: boolean
+        default: true
+      password:
+        description: '🔐 رمز فایل ZIP (اختیاری)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    
+    steps:
+      - name: 🚀 Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 📦 Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: 📥 Download from Telegram
+        run: |
+          python download_telegram.py --urls ${{ github.event.inputs.telegram_links }}
+
+      - name: 📦 Compress downloads
+        if: github.event.inputs.compress == 'true'
+        run: |
+          for folder in downloads/*/; do
+            if [ -d "$folder" ]; then
+              echo "📦 Compressing: $folder"
+              python compress.py --folder "$folder" --password "${{ github.event.inputs.password }}"
+            fi
+          done
+
+      - name: 📤 Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          if git diff --staged --quiet; then
+            echo "ℹ️ هیچ فایل جدیدی دانلود نشد"
+          else
+            git commit -m "📥 Download from Telegram: $(date '+%Y-%m-%d %H:%M:%S')"
+            git push
+            echo "✅ فایل‌ها با موفقیت آپلود شدند"
+          fi
