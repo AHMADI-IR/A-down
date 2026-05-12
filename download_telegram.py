@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Power Downloader
-دانلود خودکار از تلگرام با قابلیت فشرده‌سازی پیشرفته
+Telegram Power Downloader - نسخه نهایی با Debug کامل
 """
 
 import os
@@ -12,157 +11,233 @@ import requests
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-import random
 
-class TelegramPowerDownloader:
-    def __init__(self, output_dir="downloads", max_workers=3):
+class TelegramDownloader:
+    def __init__(self, output_dir="downloads"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.max_workers = max_workers
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
         })
-        self.downloaded_files = []
         
     def extract_post_info(self, url):
-        """استخراج اطلاعات پست از لینک تلگرام"""
+        """استخراج اطلاعات پست"""
         patterns = [
             r't\.me/([^/]+)/(\d+)',
             r'telegram\.me/([^/]+)/(\d+)',
-            r'https?://t\.me/([^/]+)/(\d+)'
         ]
         
         for pattern in patterns:
             match = re.search(pattern, url)
             if match:
                 return match.group(1), match.group(2)
-        raise ValueError(f"❌ لینک نامعتبر: {url}")
+        raise ValueError(f"لینک نامعتبر: {url}")
     
-    def get_telegram_page(self, channel, post_id):
-        """دریافت صفحه پست با تلاش چندباره"""
-        urls_to_try = [
+    def get_page_content(self, channel, post_id):
+        """دریافت محتوای صفحه با روش‌های مختلف"""
+        methods = [
+            # روش اول: صفحه عادی
+            f"https://t.me/{channel}/{post_id}",
+            # روش دوم: با embed
             f"https://t.me/{channel}/{post_id}?embed=1",
+            # روش سوم: نسخه ساده
             f"https://t.me/s/{channel}/{post_id}",
-            f"https://telegram.me/{channel}/{post_id}"
         ]
         
-        for url in urls_to_try:
+        for url in methods:
             try:
-                response = self.session.get(url, timeout=20)
-                if response.status_code == 200:
-                    return response.text
+                print(f"🔄 تلاش: {url}")
+                resp = self.session.get(url, timeout=15)
+                if resp.status_code == 200:
+                    print(f"✅ موفق: {url}")
+                    return resp.text
             except:
                 continue
-        raise Exception("امکان اتصال به تلگرام وجود ندارد")
+        
+        raise Exception("همه روش‌ها ناموفق بودن")
     
-    def extract_media_urls(self, html_content):
-        """استخراج لینک فایل‌ها از صفحه"""
-        # الگوهای مختلف برای پیدا کردن فایل
+    def save_debug_info(self, folder, html_content, url):
+        """ذخیره اطلاعات دیباگ برای بررسی"""
+        debug_folder = folder / "_debug"
+        debug_folder.mkdir(exist_ok=True)
+        
+        # ذخیره HTML صفحه
+        (debug_folder / "page.html").write_text(html_content, encoding='utf-8')
+        
+        # ذخیره لینک اصلی
+        (debug_folder / "url.txt").write_text(url, encoding='utf-8')
+        
+        # جستجوی الگوهای مختلف در HTML
+        patterns_found = {}
+        
+        patterns_to_check = {
+            'video_links': r'href="([^"]*\.(mp4|mkv|avi|mov))"',
+            'audio_links': r'href="([^"]*\.(mp3|ogg|m4a|wav))"',
+            'image_links': r'src="([^"]*\.(jpg|jpeg|png|gif|webp))"',
+            'file_links': r'href="([^"]*\.(pdf|zip|rar|exe|apk|doc|xls))"',
+            'telegram_files': r'href="(/file/[^"]+)"',
+            'tg_media': r'src="(https://[^"]*cdn[^"]*telegram[^"]+)"',
+            'data_attributes': r'data-(?:file|document|video)-url="([^"]+)"',
+        }
+        
+        for name, pattern in patterns_to_check.items():
+            matches = re.findall(pattern, html_content, re.IGNORECASE)
+            if matches:
+                patterns_found[name] = matches[:5]  # فقط 5 تا اول
+        
+        # ذخیره نتایج جستجو
+        (debug_folder / "patterns_found.json").write_text(
+            json.dumps(patterns_found, indent=2, ensure_ascii=False),
+            encoding='utf-8'
+        )
+        
+        return patterns_found
+    
+    def extract_all_urls(self, html_content):
+        """استخراج تمام URLهای ممکن"""
+        all_urls = []
+        
+        # الگوهای مختلف
         patterns = [
-            r'href="(https://[^"]+telegram[^"]+\.(mp4|mp3|jpg|png|gif|pdf|zip|rar|exe))"',
-            r'src="(https://[^"]+telegram[^"]+\.(jpg|png|gif))"',
-            r'data-document-thumbnail="([^"]+)"',
-            r'href="(/file/[^"]+)"'
+            # فایل‌های مستقیم
+            r'(?:href|src)=["\']([^"\']+\.(?:mp4|mp3|jpg|jpeg|png|gif|pdf|zip|rar|7z|exe|apk|doc|docx|xls|xlsx|ppt|pptx))["\']',
+            # فایل‌های تلگرام
+            r'(?:href|src)=["\'](/file/[^"\']+)["\']',
+            # آدرس‌های cdn تلگرام
+            r'(?:href|src)=["\'](https://[^"\']*cdn[^"\']*telegram[^"\']+)["\']',
+            # دیتا اتریبیوت‌ها
+            r'data-(?:file|document|video|audio)-url=["\']([^"\']+)["\']',
         ]
         
-        urls = []
         for pattern in patterns:
             matches = re.findall(pattern, html_content, re.IGNORECASE)
             for match in matches:
                 url = match if isinstance(match, str) else match[0]
+                # تکمیل URLهای نسبی
                 if url.startswith('/file/'):
-                    url = 'https://t.me' + url
-                if url.startswith('//'):
-                    url = 'https:' + url
-                if 'telegram' in url or 'tg' in url:
-                    urls.append(url)
+                    url = f"https://t.me{url}"
+                elif url.startswith('/'):
+                    url = f"https://t.me{url}"
+                elif url.startswith('//'):
+                    url = f"https:{url}"
+                
+                if url.startswith('http') and url not in all_urls:
+                    all_urls.append(url)
         
-        # حذف تکراری‌ها
-        return list(set(urls))
-    
-    def download_single_file(self, url, filepath, retry=3):
-        """دانلود یک فایل با قابلیت تلاش مجدد"""
-        for attempt in range(retry):
-            try:
-                print(f"⬇️  دانلود: {filepath.name}")
-                response = self.session.get(url, stream=True, timeout=60)
-                response.raise_for_status()
-                
-                total_size = int(response.headers.get('content-length', 0))
-                downloaded = 0
-                
-                with open(filepath, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if total_size > 0:
-                                percent = (downloaded / total_size) * 100
-                                print(f"\r📊 پیشرفت: {percent:.1f}%", end='')
-                
-                print(f"\n✅ ذخیره شد: {filepath.name}")
-                return True
-                
-            except Exception as e:
-                print(f"\n⚠️ تلاش {attempt+1}/{retry} ناموفق: {e}")
-                time.sleep(2)
-        
-        print(f"❌ دانلود نشد: {url}")
-        return False
+        return all_urls
     
     def download_post(self, url):
-        """دانلود کامل یک پست تلگرام"""
-        print("\n" + "="*60)
-        print("🚀 Telegram Power Downloader")
-        print("="*60)
+        """دانلود پست تلگرام با ذخیره کامل اطلاعات"""
+        print("\n" + "="*70)
+        print("🚀 Telegram Downloader - Version 2.0")
+        print("="*70)
         
         # استخراج اطلاعات
-        channel, post_id = self.extract_post_info(url)
-        print(f"📺 کانال: @{channel}")
-        print(f"🆔 پست: {post_id}")
+        try:
+            channel, post_id = self.extract_post_info(url)
+            print(f"📺 کانال: @{channel}")
+            print(f"🆔 شناسه پست: {post_id}")
+        except Exception as e:
+            print(f"❌ خطا: {e}")
+            return False
         
-        # دریافت صفحه
-        html_content = self.get_telegram_page(channel, post_id)
-        
-        # ایجاد پوشه
+        # ایجاد پوشه اصلی
         post_folder = self.output_dir / f"{channel}_{post_id}"
         post_folder.mkdir(parents=True, exist_ok=True)
+        print(f"📁 پوشه ساخته شد: {post_folder}")
         
-        # استخراج لینک‌ها
-        media_urls = self.extract_media_urls(html_content)
+        # دریافت محتوا
+        try:
+            html_content = self.get_page_content(channel, post_id)
+            print(f"📄 حجم صفحه: {len(html_content):,} کاراکتر")
+        except Exception as e:
+            print(f"❌ خطا در دریافت صفحه: {e}")
+            self.save_debug_info(post_folder, f"Error: {e}", url)
+            return False
         
-        if not media_urls:
-            print("⚠️ هیچ فایلی در این پست یافت نشد")
-            return [], post_folder
+        # ذخیره HTML برای دیباگ
+        (post_folder / "page_source.html").write_text(html_content, encoding='utf-8')
         
-        print(f"\n📊 {len(media_urls)} فایل پیدا شد:")
-        for i, url in enumerate(media_urls, 1):
-            print(f"   {i}. {url.split('/')[-1][:50]}")
+        # استخراج متن پست
+        text_content = ""
+        text_patterns = [
+            r'<div class="tgme_widget_message_text"[^>]*>(.*?)</div>',
+            r'<div class="message-text"[^>]*>(.*?)</div>',
+            r'<meta property="og:description" content="([^"]+)"',
+        ]
         
-        # دانلود همزمان فایل‌ها
-        downloaded_files = []
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {}
-            for idx, media_url in enumerate(media_urls):
-                # استخراج نام فایل
-                filename = media_url.split('/')[-1].split('?')[0]
+        for pattern in text_patterns:
+            match = re.search(pattern, html_content, re.DOTALL | re.IGNORECASE)
+            if match:
+                text_content = match.group(1)
+                text_content = re.sub(r'<[^>]+>', '', text_content)
+                text_content = re.sub(r'&[a-z]+;', '', text_content)
+                break
+        
+        if text_content:
+            text_file = post_folder / "message.txt"
+            text_file.write_text(text_content, encoding='utf-8')
+            print(f"📝 متن پست ذخیره شد ({len(text_content)} کاراکتر)")
+        else:
+            print("ℹ️ متنی در این پست وجود ندارد")
+        
+        # استخراج همه URLها
+        all_urls = self.extract_all_urls(html_content)
+        
+        # ذخیره اطلاعات دیباگ و جستجوی پیشرفته
+        patterns_found = self.save_debug_info(post_folder, html_content, url)
+        
+        # گزارش نتایج جستجو
+        print("\n🔍 نتایج جستجو:")
+        has_any = False
+        for name, items in patterns_found.items():
+            if items:
+                print(f"   ✅ {name}: {len(items)} مورد پیدا شد")
+                has_any = True
+            else:
+                print(f"   ❌ {name}: پیدا نشد")
+        
+        # دانلود فایل‌ها
+        if all_urls:
+            print(f"\n📊 {len(all_urls)} فایل پیدا شد:")
+            downloaded = 0
+            for idx, file_url in enumerate(all_urls, 1):
+                filename = file_url.split('/')[-1].split('?')[0]
                 if not filename or '.' not in filename:
-                    filename = f"file_{idx+1}.bin"
+                    filename = f"file_{idx}.bin"
                 
                 # پاکسازی نام فایل
                 filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
                 filepath = post_folder / filename
                 
-                future = executor.submit(self.download_single_file, media_url, filepath)
-                futures[future] = (media_url, filepath)
-            
-            for future in as_completed(futures):
-                media_url, filepath = futures[future]
-                if future.result():
-                    downloaded_files.append(str(filepath))
+                print(f"   {idx}. {filename[:50]}")
+                
+                # تلاش برای دانلود
+                try:
+                    resp = self.session.get(file_url, stream=True, timeout=30)
+                    if resp.status_code == 200:
+                        with open(filepath, 'wb') as f:
+                            for chunk in resp.iter_content(8192):
+                                if chunk:
+                                    f.write(chunk)
+                        print(f"      ✅ دانلود شد ({filepath.stat().st_size:,} bytes)")
+                        downloaded += 1
+                    else:
+                        print(f"      ⚠️ خطا: HTTP {resp.status_code}")
+                except Exception as e:
+                    print(f"      ❌ خطا: {str(e)[:50]}")
+        else:
+            print("\n⚠️ هیچ فایل قابل دانلودی پیدا نشد!")
+            print("\n💡 دلایل احتمالی:")
+            print("   1️⃣ این پست فقط متن دارد و فایل ضمیمه ندارد")
+            print("   2️⃣ فایل در ویجت جاسازی شده (مثل یوتیوب) است")
+            print("   3️⃣ پست خصوصی یا حذف شده است")
+            print(f"\n📁 اطلاعات دیباگ در پوشه {post_folder}/_debug ذخیره شد")
+            print("   فایل page.html را باز کنید تا محتوای واقعی صفحه را ببینید")
         
         # ذخیره متادیتا
         metadata = {
@@ -170,8 +245,13 @@ class TelegramPowerDownloader:
             'post_id': post_id,
             'url': url,
             'download_date': datetime.now().isoformat(),
-            'files_count': len(downloaded_files),
-            'files': downloaded_files
+            'has_text': bool(text_content),
+            'files_found': len(all_urls),
+            'files_downloaded': downloaded if 'downloaded' in locals() else 0,
+            'debug_info': {
+                'patterns_found': {k: len(v) for k, v in patterns_found.items()},
+                'html_size': len(html_content)
+            }
         }
         
         (post_folder / "metadata.json").write_text(
@@ -179,30 +259,24 @@ class TelegramPowerDownloader:
             encoding='utf-8'
         )
         
-        print(f"\n✨ دانلود کامل شد! {len(downloaded_files)} فایل")
+        print("\n" + "="*70)
+        print(f"✨ عملیات کامل شد!")
         print(f"📁 مسیر: {post_folder}")
+        print("="*70)
         
-        return downloaded_files, post_folder
+        return True
 
 def main():
-    parser = argparse.ArgumentParser(description='Telegram Power Downloader')
-    parser.add_argument('--urls', '-u', nargs='+', required=True, help='لینک‌های تلگرام (چندتا با فاصله)')
+    parser = argparse.ArgumentParser(description='Telegram Downloader')
+    parser.add_argument('--url', '-u', required=True, help='لینک پست تلگرام')
     parser.add_argument('--output', '-o', default='downloads', help='پوشه خروجی')
     
     args = parser.parse_args()
     
-    downloader = TelegramPowerDownloader(args.output)
+    downloader = TelegramDownloader(args.output)
+    success = downloader.download_post(args.url)
     
-    all_downloads = []
-    for url in args.urls:
-        print(f"\n📥 پردازش: {url}")
-        try:
-            files, folder = downloader.download_post(url)
-            all_downloads.extend(files)
-        except Exception as e:
-            print(f"❌ خطا در {url}: {e}")
-    
-    print(f"\n🎯 مجموع دانلودها: {len(all_downloads)} فایل")
+    return 0 if success else 1
 
 if __name__ == "__main__":
-    main()
+    exit(main())
